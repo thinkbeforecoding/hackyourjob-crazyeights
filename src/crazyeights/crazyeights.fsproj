@@ -9,4 +9,8 @@
     <Compile Include="Program.fs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="EventStore.Client.Grpc.UserManagement" Version="20.6.2-alpha.0.12" />
+  </ItemGroup>
+
 </Project>
