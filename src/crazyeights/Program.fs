@@ -357,15 +357,15 @@ module Serialization =
         open System.Text.Json
 
         let toBytes eventType converter e =
-            eventType, JsonSerializer.SerializeToUtf8Bytes (converter e, JsonSerializerOptions(WriteIndented=false))
+            eventType, Memory.op_Implicit ((JsonSerializer.SerializeToUtf8Bytes (converter e, JsonSerializerOptions(WriteIndented=false))).AsMemory())
         
-        let ofBytes case (converter: 'b -> 'e) (bytes:byte[]) =
+        let ofBytes case (converter: 'b -> 'e) (bytes:byte ReadOnlyMemory) =
             try
-                [JsonSerializer.Deserialize<'b>(Span.op_Implicit (bytes.AsSpan())) |> converter |> case]
+                [JsonSerializer.Deserialize<'b>(bytes.Span) |> converter |> case]
             with
             | _ -> []
 
-        let serialize (event:Event) : string * byte[] =
+        let serialize (event:Event) : string * byte ReadOnlyMemory =
             match event with
             | GameStarted e -> toBytes "GameStarted" GameStarted.toDto e
             | CardPlayed e -> toBytes "CardPlayed" CardPlayed.toDto e
@@ -382,15 +382,16 @@ module Serialization =
             | "InterruptMissed" -> ofBytes InterruptMissed CardPlayed.ofDto bytes
             | _ -> []
 
-    let toString (t,b) = sprintf "%s %s" t (Text.Encoding.UTF8.GetString(b: byte[]))
+    let toString (t,b: byte ReadOnlyMemory) = 
+        sprintf "%s %s" t (Text.Encoding.UTF8.GetString(b.Span))
 
     let rx = Text.RegularExpressions.Regex(@"^([^\s{]+)?\s*({.*$)")
     let ofString (s: string) = 
         let m = rx.Match(s)
         if m.Success then
-            m.Groups.[1].Value, Text.Encoding.UTF8.GetBytes m.Groups.[2].Value
+            m.Groups.[1].Value, Memory.op_Implicit ((Text.Encoding.UTF8.GetBytes m.Groups.[2].Value).AsMemory())
         else
-            "",[||]
+            "", ReadOnlyMemory.Empty
 
 
 
@@ -415,7 +416,30 @@ module Serialization =
 
 
     
-        
+open EventStore.Client
+
+module EventStore =
+    let create() =
+        let settings = EventStoreClientSettings.Create("esdb://localhost:2113?Tls=false");
+        new EventStoreClient(settings)
+
+    let foldStream (store: EventStoreClient) deserialize evolve stream position seed =
+        store.FoldStreamAsync(
+                    (fun e -> deserialize (e.Event.EventType, e.Event.Data) :> _ seq),
+                    (fun state e -> evolve state e),
+                    stream,
+                    position,
+                    seed
+                     ).Result
+
+    let appendToStream (store: EventStoreClient) serialize stream (expectedVersion: StreamRevision) events =
+        store.ConditionalAppendToStreamAsync(
+                stream,
+                expectedVersion,
+                    [ for e in events do
+                        let t,d = serialize e
+                        EventData(Uuid.NewUuid(), t, d, Nullable() )
+                 ]).Result
 
 [<EntryPoint>]
 let main argv =
