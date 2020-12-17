@@ -10,10 +10,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="EventStore.Client.Grpc" Version="20.6.2-alpha.0.12" />
-    <PackageReference Include="EventStore.Client.Grpc.Streams" Version="20.6.2-alpha.0.12" />
+    <PackageReference Include="EventStore.Client.Grpc.Streams" Version="20.6.2-alpha.0.14" />
     <PackageReference Include="Grpc.Net.Client" Version="2.34.0" />
   </ItemGroup>
 
 
 </Project>
+

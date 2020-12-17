@@ -231,6 +231,8 @@ module Serialization =
         | true, v -> Some v
         | false, _ -> None
 
+    let inline readonly (mem: byte Memory) = Memory.op_Implicit mem
+
     module Players =
         let tryOfString s =
             match Int32.TryParse(s :string) with
@@ -364,8 +366,11 @@ module Serialization =
     module Event =
         open System.Text.Json
 
-        let toBytes eventType converter e =
-            eventType, Memory.op_Implicit ((JsonSerializer.SerializeToUtf8Bytes (converter e, JsonSerializerOptions(WriteIndented=false))).AsMemory())
+        let toBytes indent eventType converter e =
+            let dto = converter e
+            let options = JsonSerializerOptions(WriteIndented=indent)
+            let bytes = JsonSerializer.SerializeToUtf8Bytes (dto, options)
+            eventType, readonly (bytes.AsMemory())
         
         let ofBytes case (converter: 'b -> 'e) (bytes:byte ReadOnlyMemory) =
             try
@@ -373,13 +378,13 @@ module Serialization =
             with
             | _ -> []
 
-        let serialize (event:Event) : string * byte ReadOnlyMemory =
+        let serialize indent (event:Event) : string * byte ReadOnlyMemory =
             match event with
-            | GameStarted e -> toBytes "GameStarted" GameStarted.toDto e
-            | CardPlayed e -> toBytes "CardPlayed" CardPlayed.toDto e
-            | WrongCardPlayed e -> toBytes "GameStarted" CardPlayed.toDto e
-            | WrongPlayerPlayed e -> toBytes "WrongPlayerPlayed" CardPlayed.toDto e
-            | InterruptMissed e -> toBytes "InterruptMissed" CardPlayed.toDto e
+            | GameStarted e -> toBytes indent "GameStarted" GameStarted.toDto e
+            | CardPlayed e -> toBytes indent "CardPlayed" CardPlayed.toDto e
+            | WrongCardPlayed e -> toBytes indent "GameStarted" CardPlayed.toDto e
+            | WrongPlayerPlayed e -> toBytes indent "WrongPlayerPlayed" CardPlayed.toDto e
+            | InterruptMissed e -> toBytes indent "InterruptMissed" CardPlayed.toDto e
 
         let deserialize (eventType, bytes) =
             match eventType with
@@ -412,6 +417,7 @@ module Serialization =
           Clockwise: bool }
 
     module State =
+        open System.Text.Json
         let toDto = function
         | NotStarted -> { Started = Unchecked.defaultof<StartedDto> }
         | Started s -> { Started = {
@@ -439,8 +445,26 @@ module Serialization =
                               Player = Player (int s.Player)
                               Direction = if s.Clockwise then Clockwise else CounterClockwise }
                  }
-                    
 
+        let serialize indent (position: int64) guard (state: State) =
+            let dto = toDto state
+            let options = JsonSerializerOptions(WriteIndented = indent)
+            let bytes = JsonSerializer.SerializeToUtf8Bytes(dto, options)
+            sprintf "%d-%s" position guard, readonly (bytes.AsMemory())
+
+        let rx = Text.RegularExpressions.Regex(@"^(\d+?)-(.*)$")
+        let deserialize guard (eventType: string,mem: byte ReadOnlyMemory) =
+            let m = rx.Match(eventType)
+            if m.Success then
+                let storedGuard = m.Groups.[2].Value
+                if storedGuard <> guard then
+                    None
+                else
+                    let version = int64 m.Groups.[1].Value
+                    let dto = JsonSerializer.Deserialize(mem.Span)
+                    Some (ofDto dto, version)
+            else
+                None
 
 
     module Command =
@@ -521,10 +545,14 @@ module Printer =
         | WrongPlayerPlayed e -> sprintf "Player %d tried to play a %s, but it was not their turn. Penalty!" (Player.value e.Player) (sprintCard e.Card)
         | InterruptMissed e -> sprintf "Player %d tried to play a %s, but it was not their turn" (Player.value e.Player) (sprintCard e.Card)
 
+    let printEvents events =
+        for e in events do
+            printfn "%s" (sprintEvent e)
     
 open EventStore.Client
 
 module EventStore =
+    open System.Linq
     let create() =
         let settings = EventStoreClientSettings.Create("esdb://localhost:2113?Tls=false");
         new EventStoreClient(settings)
@@ -538,7 +566,24 @@ module EventStore =
                     seed
                      ).Result
 
-    let appendToStream (store: EventStoreClient) serialize stream (expectedVersion: StreamRevision) events =
+    let readStream (store: EventStoreClient) deserialize stream position =
+        let result = store.ReadStreamAsync(Direction.Forwards, stream, position)
+        if result.ReadState.Result = ReadState.StreamNotFound then
+            []
+        else
+            [ for e in result.ToListAsync().Result do
+                deserialize (e.Event.EventType, e.Event.Data) ]
+
+    let tryReadLast (store: EventStoreClient) deserialize stream =
+        let result = store.ReadStreamAsync(Direction.Backwards, stream, StreamPosition.End, maxCount= 1L)
+        if result.ReadState.Result = ReadState.StreamNotFound then
+            None
+        else
+            result.ToListAsync().Result
+            |> Seq.choose (fun e -> deserialize (e.Event.EventType, e.Event.Data))
+            |> Seq.tryHead
+
+    let tryAppendToStream (store: EventStoreClient) serialize stream (expectedVersion: StreamRevision) events =
         store.ConditionalAppendToStreamAsync(
                 stream,
                 expectedVersion,
@@ -548,16 +593,35 @@ module EventStore =
                             EventData(Uuid.NewUuid(), t, d, Nullable() )
                     }).Result
 
+    let appendToStream (store: EventStoreClient) serialize stream (expectedVersion: StreamRevision) events =
+        store.ConditionalAppendToStreamAsync(
+                stream,
+                expectedVersion,
+                    seq { 
+                        for e in events do
+                            let t,d = serialize e
+                            EventData(Uuid.NewUuid(), t, d, Nullable() )
+                    }).Result
+    let forceAppendToStream (store: EventStoreClient) serialize stream events =
+        store.AppendToStreamAsync(
+                stream,
+                StreamState.Any,
+                    seq { 
+                        for e in events do
+                            let t,d = serialize e
+                            EventData(Uuid.NewUuid(), t, d, Nullable() )
+                    }).Result |> ignore
+
 [<EntryPoint>]
 let main argv =
 
     let b = 
         GameStarted { Players = players 4; FirstCard = Six ^ Club; Effect = Next}
-        |> Serialization.Event.serialize
+        |> Serialization.Event.serialize false
         |> Serialization.toString
     let c = 
         CardPlayed { Player = Player 2; Card = Six ^ Club; Effect = Next}
-        |> Serialization.Event.serialize
+        |> Serialization.Event.serialize true
         |> Serialization.toString
     let e =
         """GameStarted {"Players":4,"FirstCard":"6C","Effect":"next"}"""

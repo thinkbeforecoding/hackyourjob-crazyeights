@@ -1,0 +1,2 @@
+#!/bin/bash
+eventstored --insecure --mem-db --run-projections System --enable-atom-pub-over-http
