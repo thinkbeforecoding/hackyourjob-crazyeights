@@ -181,6 +181,17 @@ let effect card =
     | Jack -> Back
     | _ -> Next
 
+let evolve (state: State) (event: Event) : State =
+    match state, event with
+    | NotStarted, GameStarted e -> 
+        Started { Pile = Pile.start e.FirstCard 
+                  Table = Table.start e.Players |> Table.nextTable e.Effect }
+    | Started s, CardPlayed e ->
+        Started { s with 
+                    Pile = Pile.put e.Card s.Pile
+                    Table = s.Table |> Table.nextTable e.Effect  }
+    | _ -> state
+
 let decide cmd state =
     match state, cmd with
     | NotStarted, StartGame c ->
@@ -198,19 +209,8 @@ let decide cmd state =
     | Started s,  Play c when c.Card.Rank <> s.Pile.TopCard.Rank && c.Card.Suit <> s.Pile.TopCard.Suit ->
         [ WrongCardPlayed { Player = c.Player; Card = c.Card; Effect = effect c.Card }]
     | Started s,  Play c ->
-        [ CardPlayed { Player = c.Player; Card = c.Card; Effect = effect c.Card }]
+        [ CardPlayed { Player = c.Player; Card = c.Card; Effect = effect c.Card } ]
 
-
-let evolve (state: State) (event: Event) : State =
-    match state, event with
-    | NotStarted, GameStarted e -> 
-        Started { Pile = Pile.start e.FirstCard 
-                  Table = Table.start e.Players |> Table.nextTable e.Effect }
-    | Started s, CardPlayed e ->
-        Started { s with 
-                    Pile = Pile.put e.Card s.Pile
-                    Table = s.Table |> Table.nextTable e.Effect  }
-    | _ -> state
 
 module Result =
     let map2 f rx ry =
@@ -339,8 +339,7 @@ module Serialization =
           Effect: string }
     module CardPlayed =
         let toDto (e: CardPlayed): CardPlayedDto =
-            let (Player p) = e.Player
-            { Player = p
+            { Player = Player.value e.Player
               Card = Card.toString e.Card
               Effect = Effect.toString e.Effect }
 
@@ -348,6 +347,7 @@ module Serialization =
             { Player = Player dto.Player
               Card = Card.ofString dto.Card 
               Effect = Effect.ofString dto.Effect }
+
     type GameStartedDto =
         { Players: int
           FirstCard: string
@@ -382,7 +382,7 @@ module Serialization =
             match event with
             | GameStarted e -> toBytes indent "GameStarted" GameStarted.toDto e
             | CardPlayed e -> toBytes indent "CardPlayed" CardPlayed.toDto e
-            | WrongCardPlayed e -> toBytes indent "GameStarted" CardPlayed.toDto e
+            | WrongCardPlayed e -> toBytes indent "WrongCardPlayed" CardPlayed.toDto e
             | WrongPlayerPlayed e -> toBytes indent "WrongPlayerPlayed" CardPlayed.toDto e
             | InterruptMissed e -> toBytes indent "InterruptMissed" CardPlayed.toDto e
 
@@ -414,7 +414,7 @@ module Serialization =
           SecondCard: string
           Players: int
           Player: int
-          Clockwise: bool }
+          Direction: int }
 
     module State =
         open System.Text.Json
@@ -428,7 +428,7 @@ module Serialization =
                                 |> Option.toObj
                             Players = Players.value s.Table.Players
                             Player = Player.value s.Table.Player
-                            Clockwise = s.Table.Direction = Clockwise }}
+                            Direction = if s.Table.Direction = Clockwise then 1 else 0 }}
 
         let ofDto (dto: StateDto) =
             if dto.Started = Unchecked.defaultof<StartedDto> then
@@ -443,7 +443,7 @@ module Serialization =
                                 |> Option.map Card.ofString }
                     Table = { Players = players (int s.Players)
                               Player = Player (int s.Player)
-                              Direction = if s.Clockwise then Clockwise else CounterClockwise }
+                              Direction = if s.Direction = 1 then Clockwise else CounterClockwise }
                  }
 
         let serialize indent (position: int64) guard (state: State) =
@@ -612,31 +612,164 @@ module EventStore =
                             EventData(Uuid.NewUuid(), t, d, Nullable() )
                     }).Result |> ignore
 
+
+
+let readState filename =
+    if IO.File.Exists filename then
+        let json = IO.File.ReadAllText filename
+        let dto = Text.Json.JsonSerializer.Deserialize<Serialization.StateDto>(json)
+        Some (Serialization.State.ofDto dto)
+    else
+        None
+
+let readEvents filename =
+    if IO.File.Exists filename then
+        let lines = IO.File.ReadAllLines filename
+        [ for l in lines do
+            yield! l
+                    |> Serialization.ofString
+                    |> Serialization.Event.deserialize ]
+    else
+        []
+
+
+let writeState filename state =
+    let dto = Serialization.State.toDto state
+    let json = Text.Json.JsonSerializer.Serialize(dto)
+    IO.File.WriteAllText(filename, json)
+
+let appendEvents filename events =
+    let lines =
+        [ for e in events do
+            e
+            |> Serialization.Event.serialize false
+            |> Serialization.toString ]
+    IO.File.AppendAllLines(filename, lines)
+
+let getState filename =
+    readState filename
+    |> Option.defaultWith (fun _ -> 
+        readEvents (filename + "-stream")
+        |> List.fold evolve initialState)
+
+let handler filename =
+    let mutable state = getState filename
+
+    fun cmd ->
+        try
+            let events = decide cmd state
+            Printer.printEvents events
+            state <- List.fold evolve state events
+            writeState filename state
+            appendEvents (filename + "-stream") events
+        with
+        | ex ->  printfn "%O" ex
+
+module ES =
+    let loadState store stream v state =
+        let r =
+            EventStore.foldStream 
+                store 
+                Serialization.Event.deserialize
+                evolve
+                stream
+                v
+                state
+        r.Revision, r.Value
+    
+    let appendEvents store stream expectedVersion events =
+        EventStore.appendToStream
+            store
+            (Serialization.Event.serialize true)
+            stream
+            expectedVersion
+            events
+
+
+let handlerES store stream =
+    let v0, state0 = 
+        let s,v =
+            EventStore.tryReadLast 
+                    store
+                    (Serialization.State.deserialize "v2")
+                    (stream + "-snap")
+                |> Option.defaultValue (initialState, 0L)
+        ES.loadState store stream (StreamPosition.FromInt64 v) s
+    let mutable state = state0
+    let mutable v = v0
+
+    fun cmd -> 
+        try
+            let events = decide cmd state
+            Printer.printEvents events
+            let r = ES.appendEvents store stream v events
+            if r.Status = ConditionalWriteStatus.Succeeded then
+                state <- List.fold evolve state events
+                v <- r.NextExpectedStreamRevision
+
+
+                EventStore.forceAppendToStream
+                    store
+                    (Serialization.State.serialize true (v.Next().ToInt64()) "v2")
+                    ( stream + "-snap")
+                    [ state ]
+            else
+
+                let r = 
+                    EventStore.foldStream
+                     store
+                     Serialization.Event.deserialize
+                     evolve
+                     stream
+                     (v.Next() |> StreamPosition.FromStreamRevision)
+                     state
+
+                state <- r.Value
+                v <- r.Revision
+
+                failwith "Problement de concurence"
+        with
+        | ex -> printfn "%O" ex
+
+
+
+
 [<EntryPoint>]
 let main argv =
+    //Serialization.Command.printUsage()
 
-    let b = 
-        GameStarted { Players = players 4; FirstCard = Six ^ Club; Effect = Next}
-        |> Serialization.Event.serialize false
-        |> Serialization.toString
-    let c = 
-        CardPlayed { Player = Player 2; Card = Six ^ Club; Effect = Next}
-        |> Serialization.Event.serialize true
-        |> Serialization.toString
-    let e =
-        """GameStarted {"Players":4,"FirstCard":"6C","Effect":"next"}"""
-        |> Serialization.ofString
-        |> Serialization.Event.deserialize
+    use store = EventStore.create()
+    let handle = handlerES store "game"
 
-    let e2 =
-        """CardPlayed {"Player":2,"Card":"6C","Effect":"next"}"""
-        |> Serialization.ofString
-        |> Serialization.Event.deserialize
+    while true do
+        printf "> "
+        match Serialization.Command.tryParse (Console.ReadLine()) with
+        | Ok cmd ->
+            handle cmd
+        | Error e -> eprintfn "%s" e
 
-    let c1 = Serialization.Command.tryParse "start 4 3C"
-    let c2 = Serialization.Command.tryParse "p 1 1C"
+    // let b = 
+    //     GameStarted { Players = players 4; FirstCard = Six ^ Club; Effect = Next}
+    //     |> Serialization.Event.serialize false
+    //     |> Serialization.toString
+    // let c = 
+    //     CardPlayed { Player = Player 2; Card = Six ^ Club; Effect = Next}
+    //     |> Serialization.Event.serialize false
+    //     |> Serialization.toString
+    // let e =
+    //     """GameStarted {"Players":4,"FirstCard":"6C","Effect":"next"}"""
+    //     |> Serialization.ofString
+    //     |> Serialization.Event.deserialize
 
-    let c3 = Serialization.Command.serialize (StartGame { Players = players 4; FirstCard = Three ^ Club})
-    let c4 = Serialization.Command.serialize (Play { Player = Player 1; Card = Three ^ Club})
+    // let e2 =
+    //     """CardPlayed {"Player":2,"Card":"6C","Effect":"next"}"""
+    //     |> Serialization.ofString
+    //     |> Serialization.Event.deserialize
+
+    // let c1 = Serialization.Command.tryParse "start 4 3C"
+    // let c2 = Serialization.Command.tryParse "p 1 1C"
+
+    // let c3 = Serialization.Command.serialize (StartGame { Players = players 4; FirstCard = Three ^ Club})
+    // let c4 = Serialization.Command.serialize (Play { Player = Player 1; Card = Three ^ Club})
 
     0 // return an integer exit code
