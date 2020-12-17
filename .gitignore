@@ -440,6 +440,5 @@ $RECYCLE.BIN/
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-src/crazyeights.tests/Tests.fs
 
 .ionde/
