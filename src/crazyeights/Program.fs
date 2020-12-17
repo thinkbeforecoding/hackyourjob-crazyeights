@@ -26,8 +26,16 @@ type Card =
 
 let (^) rank suit = { Rank = rank; Suit = suit }
 
+
+exception TooFewPlayers
+exception AlreadyStarted
+exception NotYetStarted
+
 [<Struct>]
 type Player = Player of int
+
+module Player =
+    let value (Player p) = p
 
 type Effect =
     | Next
@@ -38,6 +46,30 @@ type Effect =
 
 [<Struct>]
 type Players = private Players of int
+
+
+
+let tryPlayers n =
+    if n < 2 then
+        Error TooFewPlayers
+    else
+        Ok (Players n)
+
+let raiseOnError result =
+    match result with
+    | Ok v -> v
+    | Error ex -> raise ex
+
+let failOnError result =
+    match result with
+    | Ok v -> v
+    | Error ex -> failwith ex
+
+let players = tryPlayers >> raiseOnError
+
+
+module Players =
+    let value (Players n) = n
 
 type Direction =
     | Clockwise
@@ -62,8 +94,8 @@ module Table =
           Direction = Clockwise }
     
     let nextPlayer table =
-        let (Players n ) = table.Players
-        let (Player p ) = table.Player
+        let n = Players.value table.Players
+        let p  = Player.value table.Player
         let nextPlayer = 
             match table.Direction with
             | Clockwise -> (p+1) % n
@@ -91,31 +123,6 @@ module Table =
         | Interrupt -> table
         | BreakingInterrupt player -> breakingInterrupt player table
 
-
-exception TooFewPlayers
-exception AlreadyStarted
-exception NotYetStarted
-
-let tryPlayers n =
-    if n < 2 then
-        Error TooFewPlayers
-    else
-        Ok (Players n)
-
-let raiseOnError result =
-    match result with
-    | Ok v -> v
-    | Error ex -> raise ex
-
-let failOnError result =
-    match result with
-    | Ok v -> v
-    | Error ex -> failwith ex
-
-let players = tryPlayers >> raiseOnError
-
-module Players =
-    let value (Players n) = n
 
 
 type Command =
@@ -269,7 +276,8 @@ module Serialization =
             | StartsWith "4" -> Ok Four
             | StartsWith "3" -> Ok Three
             | StartsWith "2" -> Ok Two
-            | StartsWith "1" -> Ok Ace
+            | StartsWith "1"
+            | StartsWith "A" -> Ok Ace
             | s -> Error (sprintf "Unknown rank in %s" s)
         
         let ofString = tryOfString >> failOnError
@@ -393,6 +401,46 @@ module Serialization =
         else
             "", ReadOnlyMemory.Empty
 
+    type StateDto =
+        { Started: StartedDto }
+    
+    and StartedDto =
+        { TopCard: string
+          SecondCard: string
+          Players: int
+          Player: int
+          Clockwise: bool }
+
+    module State =
+        let toDto = function
+        | NotStarted -> { Started = Unchecked.defaultof<StartedDto> }
+        | Started s -> { Started = {
+                            TopCard = Card.toString s.Pile.TopCard
+                            SecondCard = 
+                                s.Pile.SecondCard
+                                |> Option.map Card.toString
+                                |> Option.toObj
+                            Players = Players.value s.Table.Players
+                            Player = Player.value s.Table.Player
+                            Clockwise = s.Table.Direction = Clockwise }}
+
+        let ofDto (dto: StateDto) =
+            if dto.Started = Unchecked.defaultof<StartedDto> then
+                NotStarted
+            else
+                let s = dto.Started
+                Started { 
+                    Pile = { TopCard = Card.ofString s.TopCard 
+                             SecondCard =
+                                s.SecondCard
+                                |> Option.ofObj
+                                |> Option.map Card.ofString }
+                    Table = { Players = players (int s.Players)
+                              Player = Player (int s.Player)
+                              Direction = if s.Clockwise then Clockwise else CounterClockwise }
+                 }
+                    
+
 
 
     module Command =
@@ -411,9 +459,67 @@ module Serialization =
             | _ ->
                 Error "Unknown command"
         let tryParse (s:string) =
-            s.Split(' ') |> tryParseArgs
+            s.Split(' ', StringSplitOptions.RemoveEmptyEntries) |> tryParseArgs
 
 
+        let serialize command =
+            match command with
+            | StartGame c ->
+                sprintf "start %d %s" (Players.value c.Players) (Card.toString c.FirstCard)
+            | Play c ->
+                sprintf "p %d %s" (Player.value c.Player) (Card.toString c.Card)
+
+        let printUsage() =
+            printfn "usage:"
+            printfn "start <players> <firstCard>"
+            printfn "    players     number of players"
+            printfn "    firstCard   the first card"
+            printfn "p <player> <card>"
+            printfn "    player      player identifier"
+            printfn "    card        the card to play"
+            printfn ""
+            printfn "card format: <rank><suit>"
+            printfn "    rank        1 .. 10, J, Q,K"
+            printfn "    suit        C,S,H,D"
+            printfn ""
+            printfn "Use Ctrl+C to quit"
+
+module Printer =
+    open Serialization
+
+    let sprintSuit = function
+        | Spade -> "♠"
+        | Club -> "♣"
+        | Heart -> "♥"
+        | Diamond -> "♦"
+
+    let sprintCard card = 
+        Rank.toString card.Rank + sprintSuit card.Suit
+
+    let sprintEffectVerb = function
+        | Interrupt
+        | BreakingInterrupt _ -> "interrupted with"
+        | _ -> "played"
+
+    let sprintEffect = function
+        | Next -> "."
+        | Skip -> ". Skip next player!"
+        | Back -> ". Kickback!"
+        | Interrupt -> ". Game continues as if nothing happened."
+        | BreakingInterrupt p -> sprintf ". Game now resumes after player %d" (Player.value p)
+        
+    let sprintEvent =
+        function
+        | GameStarted e -> sprintf "%d Players game started with a %s" (Players.value e.Players) (sprintCard e.FirstCard)
+        | CardPlayed e -> 
+            sprintf "Player %d %s a %s%s" 
+                (Player.value e.Player) 
+                (sprintEffectVerb e.Effect)
+                (sprintCard e.Card)
+                (sprintEffect e.Effect)
+        | WrongCardPlayed e -> sprintf "Player %d tried to play a %s, but it was neither same rank nor same suit. Penalty!" (Player.value e.Player) (sprintCard e.Card)
+        | WrongPlayerPlayed e -> sprintf "Player %d tried to play a %s, but it was not their turn. Penalty!" (Player.value e.Player) (sprintCard e.Card)
+        | InterruptMissed e -> sprintf "Player %d tried to play a %s, but it was not their turn" (Player.value e.Player) (sprintCard e.Card)
 
     
 open EventStore.Client
@@ -436,13 +542,15 @@ module EventStore =
         store.ConditionalAppendToStreamAsync(
                 stream,
                 expectedVersion,
-                    [ for e in events do
-                        let t,d = serialize e
-                        EventData(Uuid.NewUuid(), t, d, Nullable() )
-                 ]).Result
+                    seq { 
+                        for e in events do
+                            let t,d = serialize e
+                            EventData(Uuid.NewUuid(), t, d, Nullable() )
+                    }).Result
 
 [<EntryPoint>]
 let main argv =
+
     let b = 
         GameStarted { Players = players 4; FirstCard = Six ^ Club; Effect = Next}
         |> Serialization.Event.serialize
@@ -463,4 +571,8 @@ let main argv =
 
     let c1 = Serialization.Command.tryParse "start 4 3C"
     let c2 = Serialization.Command.tryParse "p 1 1C"
+
+    let c3 = Serialization.Command.serialize (StartGame { Players = players 4; FirstCard = Three ^ Club})
+    let c4 = Serialization.Command.serialize (Play { Player = Player 1; Card = Three ^ Club})
+
     0 // return an integer exit code
