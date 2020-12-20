@@ -26,7 +26,6 @@ type Card =
 
 let (^) rank suit = { Rank = rank; Suit = suit }
 
-
 exception TooFewPlayers
 exception AlreadyStarted
 exception NotYetStarted
@@ -45,7 +44,7 @@ type Effect =
     | BreakingInterrupt of Player
 
 [<Struct>]
-type Players = private Players of int
+type Players = Players of int
 
 
 
@@ -231,8 +230,8 @@ module Serialization =
         | true, v -> Some v
         | false, _ -> None
 
-    let inline readonly (mem: byte Memory) = Memory.op_Implicit mem
 
+    let inline readonly (mem: byte Memory) = Memory.op_Implicit mem
     module Players =
         let tryOfString s =
             match Int32.TryParse(s :string) with
@@ -326,12 +325,13 @@ module Serialization =
             | "skip" -> Ok Skip
             | "back" -> Ok Back
             | StartsWith "int" as s ->
-                match Int32.TryParse(s.AsSpan().Slice(3)) with
+                match Int32.TryParse(s.Substring(3)) with
                 | true, v -> Ok (BreakingInterrupt (Player v))
                 | _ -> Ok Interrupt
             | s -> Error (sprintf "Unknown effect %s" s)
 
         let ofString = tryOfString >> failOnError
+
 
     type CardPlayedDto =
         { Player: int
@@ -362,6 +362,7 @@ module Serialization =
             { Players = players dto.Players
               FirstCard = Card.ofString dto.FirstCard 
               Effect = Effect.ofString dto.Effect }
+
 
     module Event =
         open System.Text.Json
@@ -483,7 +484,7 @@ module Serialization =
             | _ ->
                 Error "Unknown command"
         let tryParse (s:string) =
-            s.Split(' ', StringSplitOptions.RemoveEmptyEntries) |> tryParseArgs
+            s.Split([|' '|], StringSplitOptions.RemoveEmptyEntries) |> tryParseArgs
 
 
         let serialize command =
@@ -548,7 +549,7 @@ module Printer =
     let printEvents events =
         for e in events do
             printfn "%s" (sprintEvent e)
-    
+
 open EventStore.Client
 
 module EventStore =
@@ -566,6 +567,7 @@ module EventStore =
                     seed
                      ).Result
 
+
     let readStream (store: EventStoreClient) deserialize stream position =
         let result = store.ReadStreamAsync(Direction.Forwards, stream, position)
         if result.ReadState.Result = ReadState.StreamNotFound then
@@ -573,6 +575,18 @@ module EventStore =
         else
             [ for e in result.ToListAsync().Result do
                 deserialize (e.Event.EventType, e.Event.Data) ]
+
+    let readAll (store: EventStoreClient) deserialize position =
+        let result = store.ReadAllAsync(Direction.Forwards, position)
+        let mutable lastPos = position
+        let events = 
+            [for ed in result.ToListAsync().Result do
+                lastPos <- ed.Event.Position
+                for e in deserialize(ed.Event.EventStreamId, ed.Event.EventType, ed.Event.Data) do
+                    ed.Event.Position, e ]
+        lastPos, events
+
+        
 
     let tryReadLast (store: EventStoreClient) deserialize stream =
         let result = store.ReadStreamAsync(Direction.Backwards, stream, StreamPosition.End, maxCount= 1L)
@@ -666,6 +680,8 @@ let handler filename =
         | ex ->  printfn "%O" ex
 
 module ES =
+    let noStreamId serializer =
+        fun (_,t,d) -> serializer(t,d)
     let loadState store stream v state =
         let r =
             EventStore.foldStream 
@@ -685,16 +701,18 @@ module ES =
             expectedVersion
             events
 
-
-let handlerES store stream =
-    let v0, state0 = 
+    let getState store stream =
         let s,v =
             EventStore.tryReadLast 
                     store
                     (Serialization.State.deserialize "v2")
                     (stream + "-snap")
                 |> Option.defaultValue (initialState, 0L)
-        ES.loadState store stream (StreamPosition.FromInt64 v) s
+        loadState store stream (StreamPosition.FromInt64 v) s
+
+let handlerES store stream =
+    let v0, state0 = ES.getState store stream
+
     let mutable state = state0
     let mutable v = v0
 
@@ -713,6 +731,8 @@ let handlerES store stream =
                     (Serialization.State.serialize true (v.Next().ToInt64()) "v2")
                     ( stream + "-snap")
                     [ state ]
+                
+                events
             else
 
                 let r = 
@@ -729,24 +749,349 @@ let handlerES store stream =
 
                 failwith "Problement de concurence"
         with
-        | ex -> printfn "%O" ex
+        | ex -> printfn "(%O" ex
+                []
+type GameId = GameId of int
+module GameId =
+    let value (GameId id) = id
+
+    let tryParseFromStream (stream: string) =
+        if stream.StartsWith("game-") then
+            let index = stream.LastIndexOf('-') + 1
+            match Int32.TryParse(stream.Substring(index)) with
+            | true, v -> Some (GameId v)
+            | false, _ -> None
+        else
+            None
+
+    let parseFromStream (stream: string) =
+        let index = stream.LastIndexOf('-')
+        GameId (int (stream.Substring(index)))
+
+
+module CardCount =
+    type DBOp =
+        | Increment of GameId
+
+    let guard = "v2"
+
+    let evolve (game,event) =
+        match event with
+        | CardPlayed _ -> [ Increment game ]
+        | _ -> []
+
+    let evolveDb cnx version (game, event) =
+        for op in evolve (game,event) do
+            match op with
+            | Increment game -> Db.CardCount.increment cnx (GameId.value game, guard, version)
+
+    let initialState = Map.empty
+    
+    let increment key state =
+        let newCount = 
+            match Map.tryFind key state with
+            | Some count -> count+1
+            | None -> 1
+        Map.add key newCount state 
+
+    let evolve' state (game, event) = 
+        evolve (game,event)
+        |> List.fold (fun s op ->
+            match op with
+            | Increment game -> increment game s
+        ) state
+
+
+    let load cnx =
+        let loadedGuard, version, counts = Db.CardCount.load cnx
+        if loadedGuard <> guard then
+            Position.Start, initialState
+        else
+            let gameCounts =
+                [ for g,c in counts do 
+                    GameId g, c]
+                |> Map.ofList
+            version, gameCounts 
+
+    let save cnx position state =
+        Db.CardCount.deleteAll cnx
+        for (game,count) in Map.toSeq state do
+            Db.CardCount.insert cnx (GameId.value game,count)
+        Db.CardCount.insertPosition cnx (guard,position)
+
+    let loadPosition cnx =
+        let loadedGuard, pos = Db.CardCount.loadPosition cnx
+        if loadedGuard <> guard then
+            Position.Start
+        else
+            pos
+
+    let start cnx =
+        let mutable position = Db.Sql.run cnx loadPosition
+
+        let update (pos, event) =
+            if position.CompareTo(pos) < 0 then
+                Db.Sql.run cnx (fun c ->
+                    evolveDb c pos event 
+                )
+            position <- pos
+
+        let batchUpdate events =
+            let p, state = Db.Sql.run cnx load
+            let mutable pos = p
+            let mutable state = state
+            let mutable changed = false
+            for p,e  in events do
+                if pos.CompareTo(p) < 0 then
+                    state <- evolve' state e
+                    pos <- p
+                    changed <- true
+            if changed then
+                Db.Sql.transaction cnx (fun cnx ->
+                    Db.CardCount.deleteAll cnx
+                    for g,c in Map.toSeq state do
+                        Db.CardCount.insert cnx (GameId.value g,c)
+                    Db.CardCount.insertPosition cnx (guard, pos)
+                )
+                position <- pos
+
+        position, update, batchUpdate
+
+
+module TurnsSinceLastError =
+    type DbOp =
+    | Increment of GameId * Player
+    | Reset of GameId * Player
+
+    let guard = "v2"
+    let evolve (game, event) =
+        match event with
+        | CardPlayed e -> [Increment(game,e.Player)]
+        | WrongCardPlayed { Player = player}
+        | WrongPlayerPlayed { Player = player}
+             -> [Reset(game,player)]
+        | _ -> []
+
+    let evolveDb cnx version (game, event) =
+        for op in evolve (game, event) do
+            match op with
+            | Increment(game,player)->
+                Db.TurnsSinceLastError.increment cnx (GameId.value game, Player.value player, guard, version)
+            | Reset(game,player) ->
+                Db.TurnsSinceLastError.reset cnx (GameId.value game, Player.value player, guard, version)
+
+    let initialState = Map.empty
+
+    let increment key state =
+        match Map.tryFind key state with
+        | Some count -> Map.add key (count+1) state
+        | None -> Map.add key 1 state
+
+    let reset key state =
+        Map.add key 0 state
+
+
+    let evolve' state (game, event) =
+        evolve (game,event)
+        |> List.fold (fun s op ->
+            match op with
+            | Increment(g,p) -> increment (g,p) s
+            | Reset(g,p) -> reset (g,p) s
+        ) state
+
+    let loadPosition cnx =
+        let loadedGuard, position = Db.TurnsSinceLastError.loadPosition cnx
+        if loadedGuard <> guard then
+            Position.Start
+        else
+            position
+
+    let load cnx =
+        let loadedGuard, version, state = Db.TurnsSinceLastError.load cnx
+        if loadedGuard <> guard then
+            Position.Start, initialState
+        else
+            let gameCounts =
+                [ for g,p,c in state do 
+                    (GameId g,Player p), c]
+                |> Map.ofList
+            version, gameCounts 
+
+    let save cnx version state =
+        Db.TurnsSinceLastError.deleteAll cnx
+        for ((game,player), count) in Map.toSeq state do
+            Db.TurnsSinceLastError.insert cnx (GameId.value game, Player.value player, count)
+        Db.TurnsSinceLastError.insertPosition cnx (guard, version)
+
+    let start cnx =
+        let mutable position = Db.Sql.run cnx loadPosition
+                
+        let update (pos, event) =
+            if position.CompareTo(pos) < 0 then
+                Db.Sql.run cnx (fun c->
+                    evolveDb c pos event )
+
+        let batchUpdate events =
+            let p, state = Db.Sql.run cnx load
+            let mutable pos = p
+            let mutable state = state
+            let mutable changed = false
+            for p,e  in events do
+                if pos.CompareTo(p) < 0 then
+                    state <- evolve' state e
+                    pos <- p
+                    changed <- true
+            if changed then
+                Db.Sql.transaction cnx (fun cnx ->
+                    Db.TurnsSinceLastError.deleteAll cnx
+                    for (g,p),c in Map.toSeq state do
+                        Db.TurnsSinceLastError.insert cnx (GameId.value g, Player.value p, c)
+                    Db.TurnsSinceLastError.insertPosition cnx (guard, pos)
+                )
+                position <- pos        
+        position, update, batchUpdate
+
+        
+
+
+// type MailBoxMsg =
+//     | Update of (unit -> unit)
+//     | Query of ((State * StreamPosition) -> unit)
+
+// let proj =
+//     MailboxProcessor.Start (fun mailbox ->
+//         let rec loop state version =
+//             async {
+//                 let! msg = mailbox.Receive()
+//                 match msg with
+//                 | Update reply ->
+//                       let r =
+//                         EventStore.foldStream
+//                             store
+//                             Serialization.Event.deserialize
+//                             evolve
+//                             stream
+//                             version
+//                             state
+//                       reply()
+                      
+//                       saveSnapshot()
+//                       return! loop r.Value r.Version
+//                 | Query reply ->
+//                     let r =
+//                         EventStore.foldStream
+//                             store
+//                             Serialization.Event.deserialize
+//                             evolve
+//                             stream
+//                             version
+//                             state
+
+//                     reply (r.State, r.Version)
+//                     return! loop r.State r.Version
+//             }
+//         let s,v = loadFromSnapshot
+//         let state, version =
+//             EventStore.foldStream
+//                 ...
+//         loop s v
+//     )
+
+// proj.Post Update
+
+// proj.PostAndAsyncReply(fun c -> Query c.Reply)
+
+// Hands
+// PlayerId , Card
+
+// INSERT (PlayerId, Card) VALUE (@player, @card) IN HANDS
+// DELETE FROM Hands WHERE PlayerId = @player AND Card = @card
 
 
 
+    
+    
+    // let gameCounterDb db events =
+    //     let count = db.Query "SELECT Count FROM GameCount"
+    //     let newCount = List.fold evolve count events
+    //     db.Exec "UPDATE Count = @count FROM GameCount" {| count = newCount |}
+
+
+module PendingNotifications =
+    type GameId=  GameId of int
+    type State = GameId Set
+
+    let evolve state event =
+        match event with
+        | (gameId, GameStarted _ ) -> Set.add gameId state
+        | (gameId, NotificationSent) -> Set.remove gameId state
+        | _ -> state
+
+let minPos (x: Position) (y: Position) =
+    if x.CompareTo(y) <= 0 then x else y
 
 [<EntryPoint>]
 let main argv =
     //Serialization.Command.printUsage()
 
+    let game = GameId 1
+    let stream = sprintf "game-%d" (GameId.value game) 
     use store = EventStore.create()
-    let handle = handlerES store "game"
+    let handle = handlerES store stream
+    
+    let cnxString = "server=localhost;database=crazyeights;user id=sa;password=Hackyourj0b"
+    let cardCountPos, cardCountProj, cardCountBatch = CardCount.start cnxString
+    let turnPos , turnProj, turnBatch = TurnsSinceLastError.start cnxString
+
+    let mutable allPos = List.reduce minPos [turnPos; cardCountPos]
+
+    let catchUp() =
+
+        let lastPos, events =
+            EventStore.readAll 
+                store
+                (fun (stream, t,d) ->
+                    match GameId.tryParseFromStream stream with
+                    | Some game ->
+                        [ for e in Serialization.Event.deserialize (t,d) do
+                            game, e ]
+                    | None -> [])
+                allPos
+        for e in events do
+            cardCountProj e
+            turnProj e
+        allPos <- lastPos
+
+    let catchUpBatch() =
+        let lastPos, events =
+            EventStore.readAll 
+                store
+                (fun (stream, t,d) ->
+                    match GameId.tryParseFromStream stream with
+                    | Some game ->
+                        [ for e in Serialization.Event.deserialize (t,d) do
+                            game, e ]
+                    | None -> [])
+                allPos
+        cardCountBatch events
+        turnBatch events
+
+    if allPos = Position.Start then
+        catchUpBatch()
+    else
+
+        catchUp()
+
 
     while true do
         printf "> "
         match Serialization.Command.tryParse (Console.ReadLine()) with
         | Ok cmd ->
-            handle cmd
-        | Error e -> eprintfn "%s" e
+            let events = handle cmd
+            catchUp()
+
+        | Error e -> 
+            eprintfn "%s" e
 
     // let b = 
     //     GameStarted { Players = players 4; FirstCard = Six ^ Club; Effect = Next}

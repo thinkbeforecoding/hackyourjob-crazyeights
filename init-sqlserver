@@ -1,0 +1,3 @@
+#!/bin/bash
+script=$(<init.sql)
+docker exec -it sqlserver /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P Hackyourj0b -Q "$script"
